@@ -141,6 +141,8 @@ class StatuslineTests(unittest.TestCase):
             self.assertEqual(merged["trustedWorkspaces"], ["/Users/example/中文目录"])
             self.assertTrue(merged["statusLine"]["enabled"])
             self.assertTrue(merged["statusLine"]["stack_with_default"])
+            if os.name == "nt":
+                self.assertNotIn('"', merged["statusLine"]["command"])
 
             install.uninstall(agy_dir=tmp_agy)
             with open(settings_path, "r", encoding="utf-8") as f:
@@ -148,6 +150,38 @@ class StatuslineTests(unittest.TestCase):
             self.assertNotIn("statusLine", restored)
             self.assertEqual(restored["model"], "Gemini 4 Carbon (High)")
             self.assertFalse(os.path.exists(os.path.join(tmp_agy, "statusline.py")))
+
+    def test_install_works_in_directory_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp_root:
+            spaced_agy = os.path.join(tmp_root, "dir with spaces", "antigravity-cli")
+            install.install(agy_dir=spaced_agy, stack_with_default=True)
+            with open(os.path.join(spaced_agy, "settings.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cmd = cfg["statusLine"]["command"]
+            if os.name == "nt":
+                self.assertNotIn('"', cmd)
+            out = install.verify_script(os.path.join(spaced_agy, "statusline.py"), command=cmd)
+            self.assertIn("上下文", strip_ansi(out))
+
+    def test_windows_fallback_when_short_path_unavailable(self):
+        if os.name != "nt":
+            return
+        with tempfile.TemporaryDirectory() as tmp_root:
+            spaced_dir = os.path.join(tmp_root, "no 8dot3 fallback")
+            os.makedirs(spaced_dir, exist_ok=True)
+            target = os.path.join(spaced_dir, "statusline.py")
+            with open(os.path.join(REPO_ROOT, "statusline.py"), "rb") as src, open(target, "wb") as dst:
+                dst.write(src.read())
+
+            orig_short = install._win_short_path
+            try:
+                install._win_short_path = lambda p: p
+                cmd = install.format_statusline_command(target)
+                self.assertNotIn('"', cmd)
+                out = install.verify_script(target, command=cmd)
+                self.assertIn("上下文", strip_ansi(out))
+            finally:
+                install._win_short_path = orig_short
 
 
 if __name__ == "__main__":

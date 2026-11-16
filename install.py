@@ -17,6 +17,11 @@ import subprocess
 import sys
 import urllib.request
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 RAW_SCRIPT_URL = (
     os.environ.get("AGY_STATUSLINE_RAW_URL")
     or "https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/statusline.py"
@@ -27,12 +32,30 @@ def get_agy_dir():
     return os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
 
 
+def _win_short_path(path):
+    """Convert a Windows path with spaces to an 8.3 short path when available."""
+    if not path or " " not in path or os.name != "nt":
+        return path
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(1024)
+        res = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))
+        if res and buf.value and " " not in buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
 def resolve_python_command():
     """Choose a stable Python executable path for settings.json."""
     if os.name == "nt":
         # On Windows, pin exact sys.executable to avoid Microsoft Store python3.exe stub issues.
-        exe = sys.executable or "python"
-        return f'"{exe}"' if " " in exe else exe
+        # Avoid double quotes: agy invokes `cmd /c <command>` via Go's exec.Command, which
+        # escapes `"` into `\"` that cmd.exe passes literally to python.exe.
+        exe = _win_short_path(sys.executable or "python")
+        return exe
 
     # On macOS/Linux, prefer symlinked PATH binary (e.g. /opt/homebrew/bin/python3)
     # so Homebrew patch upgrades don't invalidate Cellar paths.
@@ -40,16 +63,38 @@ def resolve_python_command():
     return f'"{which_py}"' if " " in which_py else which_py
 
 
-def format_statusline_command(script_path):
-    py_cmd = resolve_python_command()
+def format_statusline_command(script_path, py_exe=None):
     if os.name == "nt":
-        quoted_script = f'"{script_path}"'
-        return f"{py_cmd} {quoted_script}"
+        raw_py = _win_short_path(py_exe if py_exe is not None else (sys.executable or "python"))
+        raw_script = _win_short_path(script_path)
+
+        env_prefixes = []
+        if " " in raw_py:
+            py_dir, py_name = os.path.split(raw_py)
+            if py_dir:
+                env_prefixes.append(f"set PATH={py_dir};%PATH%")
+            py_part = py_name or "python"
+        else:
+            py_part = raw_py
+
+        if " " in raw_script:
+            script_dir, script_name = os.path.split(raw_script)
+            mod_name = os.path.splitext(script_name)[0] or "statusline"
+            if script_dir:
+                env_prefixes.append(f"set PYTHONPATH={script_dir}")
+            cmd_core = f"{py_part} -m {mod_name}"
+        else:
+            cmd_core = f"{py_part} {raw_script}"
+
+        return "&&".join(env_prefixes + [cmd_core])
+
+    py_cmd = resolve_python_command() if py_exe is None else (f'"{py_exe}"' if " " in py_exe else py_exe)
     # Use ~ on POSIX so settings.json stays clean and portable across home paths
     home = os.path.expanduser("~")
     if script_path.startswith(home + os.sep):
         rel = "~/" + script_path[len(home) + 1 :].replace("\\", "/")
-        return f"{py_cmd} {rel}"
+        if " " not in rel:
+            return f"{py_cmd} {rel}"
     return f'{py_cmd} "{script_path}"'
 
 
@@ -92,7 +137,7 @@ def obtain_statusline_source():
     return content, RAW_SCRIPT_URL
 
 
-def verify_script(script_path):
+def verify_script(script_path, command=None):
     sample = json.dumps(
         {
             "workspace": {"current_dir": os.getcwd()},
@@ -107,8 +152,12 @@ def verify_script(script_path):
             },
         }
     )
+    if command:
+        runner = ["cmd", "/c", command] if os.name == "nt" else ["sh", "-c", command]
+    else:
+        runner = [sys.executable, script_path]
     proc = subprocess.run(
-        [sys.executable, script_path],
+        runner,
         input=sample,
         capture_output=True,
         text=True,
@@ -133,12 +182,13 @@ def install(agy_dir=None, stack_with_default=True):
     if os.name != "nt":
         os.chmod(target_script, 0o755)
 
-    preview = verify_script(target_script)
+    command = format_statusline_command(target_script)
+    preview = verify_script(target_script, command=command)
 
     settings = load_settings(settings_path)
     settings["statusLine"] = {
         "type": "command",
-        "command": format_statusline_command(target_script),
+        "command": command,
         "padding": 0,
         "enabled": True,
         "stack_with_default": bool(stack_with_default),
