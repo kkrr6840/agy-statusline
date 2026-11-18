@@ -31,6 +31,9 @@ class StatuslineTests(unittest.TestCase):
             statusline.format_dir(os.path.join(home, "Documents", "卜悦", "boyue-finance")),
             "~/…/卜悦/boyue-finance",
         )
+        self.assertEqual(statusline.format_dir(r"D:\\"), "D:/")
+        self.assertEqual(statusline.format_dir(r"D:\work\boyue"), "D:/work/boyue")
+        self.assertEqual(statusline.format_dir(r"D:\work\company\boyue\app"), "D:/…/boyue/app")
 
     def test_render_full_payload_and_quotas(self):
         payload = {
@@ -85,14 +88,25 @@ class StatuslineTests(unittest.TestCase):
     def test_narrow_terminal_hides_quota_bars(self):
         payload = {
             "cwd": os.path.expanduser("~"),
+            "context_window": {
+                "used_percentage": 40.0,
+                "context_window_size": 1048576,
+                "current_usage": {"input_tokens": 419430},
+            },
             "quota": {
                 "gemini-5h": {"remaining_fraction": 0.5, "reset_in_seconds": 3600},
             },
             "terminal_width": 80,
         }
         out = strip_ansi(statusline.render(payload))
+        self.assertIn("上下文 [██░░░] 40% (419k/1M)", out)
         self.assertIn("Gemini 5h 50%(1h)", out)
         self.assertNotIn("Gemini 5h [", out)
+
+        ultra_narrow = dict(payload, terminal_width=68)
+        out_ultra = strip_ansi(statusline.render(ultra_narrow))
+        self.assertIn("上下文 [██░░░] 40%", out_ultra)
+        self.assertNotIn("(419k/1M)", out_ultra)
 
     def test_git_branch_and_dirty_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,6 +176,14 @@ class StatuslineTests(unittest.TestCase):
                 self.assertNotIn('"', cmd)
             out = install.verify_script(os.path.join(spaced_agy, "statusline.py"), command=cmd)
             self.assertIn("上下文", strip_ansi(out))
+
+    def test_replace_default_enables_show_model_automatically(self):
+        with tempfile.TemporaryDirectory() as tmp_agy:
+            install.main(["--agy-dir", tmp_agy, "--replace-default"])
+            with open(os.path.join(tmp_agy, "settings.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.assertFalse(cfg["statusLine"]["stack_with_default"])
+            self.assertIn("--show-model", cfg["statusLine"]["command"])
 
     def test_windows_fallback_when_short_path_unavailable(self):
         if os.name != "nt":

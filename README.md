@@ -17,7 +17,7 @@
 
 ## 一键安装 / 跨电脑复用
 
-安装器会自动备份已有的 `~/.gemini/antigravity-cli/settings.json`（生成 `.bak`），仅合并写入 `statusLine` 字段，原有模型、权限和信任目录配置原样保留。安装后新开或重启一次 `agy` 即可显示（或在会话内执行 `/statusline enable`）。
+安装器会自动备份已有的 `~/.gemini/antigravity-cli/settings.json`（生成 `.bak`），仅合并写入 `statusLine` 字段，原有模型、权限和信任目录配置原样保留。安装后新开或重启一次 `agy` 即可显示（或在会话内执行 `/statusline on`）。
 
 ### macOS / Linux
 
@@ -36,31 +36,36 @@ irm https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/install.ps1 |
 ```bash
 git clone https://github.com/kkrr6840/agy-statusline.git
 cd agy-statusline
-python3 install.py
+python3 install.py   # Windows 下请使用: python install.py
 ```
 
 ## 常用操作与可选参数
 
-- **替换官方默认状态栏**（不叠加，单栏显示）：
-  ```bash
-  curl -fsSL https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/install.sh | bash -s -- --replace-default
-  ```
+- **替换官方默认状态栏**（不叠加，单栏显示并自动在首行展示当前模型名）：
+  - macOS / Linux：
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/install.sh | bash -s -- --replace-default
+    ```
+  - Windows PowerShell：
+    ```powershell
+    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/install.ps1))) --replace-default
+    ```
 - **在 `agy` 会话内临时开关**：
   - `/statusline off` / `/statusline on`
 - **彻底卸载并恢复原状**：
   ```bash
-  python3 install.py --uninstall
+  python3 install.py --uninstall   # Windows: python install.py --uninstall
   ```
   （或在 `agy` 内直接输入 `/statusline reset`）
 - **环境变量微调**：
   - `AGY_STATUSLINE_WARN_PCT=85`：自定义上下文变红预警百分比阈值（默认 `85`）
-  - `AGY_STATUSLINE_SHOW_MODEL=1`：在第一行额外显示当前模型名（适合 `--replace-default` 模式）
+  - `AGY_STATUSLINE_SHOW_MODEL=1`：在第一行额外显示当前模型名（`--replace-default` 模式默认已附带 `--show-model`）
   - `NO_COLOR=1`：关闭 ANSI 颜色输出
 
 ## 本地测试
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # Windows: python -m unittest discover -s tests -v
 ```
 
 ## License

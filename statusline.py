@@ -98,6 +98,17 @@ def format_dir(raw_dir):
             return "~/" + "/".join(parts)
         return "~/…/" + "/".join(parts[-2:])
 
+    # Preserve Windows drive prefix (e.g. D:/…/proj/app instead of …/proj/app)
+    slashed = raw_dir.replace("\\", "/")
+    if len(slashed) >= 2 and slashed[0].isalpha() and slashed[1] == ":":
+        drive = slashed[:2]
+        rest_parts = [p for p in slashed[2:].split("/") if p]
+        if not rest_parts:
+            return f"{drive}/"
+        if len(rest_parts) <= 2:
+            return f"{drive}/" + "/".join(rest_parts)
+        return f"{drive}/…/" + "/".join(rest_parts[-2:])
+
     parts = [p for p in norm.replace("\\", "/").split("/") if p]
     if len(parts) <= 2:
         return norm.replace("\\", "/")
@@ -165,6 +176,8 @@ def get_git_segment(target_dir, vcs_payload):
     ahead = 0
     behind = 0
 
+    git_timeout = 0.40 if os.name == "nt" else 0.20
+    extra_kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
     try:
         proc = subprocess.run(
             ["git", "-C", target_dir, "--no-optional-locks", "status", "--porcelain=v1", "-b"],
@@ -172,7 +185,8 @@ def get_git_segment(target_dir, vcs_payload):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=0.18,
+            timeout=git_timeout,
+            **extra_kwargs,
         )
         if proc.returncode == 0:
             lines = proc.stdout.splitlines()
@@ -220,7 +234,7 @@ def get_git_segment(target_dir, vcs_payload):
     return f"{color}⎇ {branch}{marks}{sync}{RESET}"
 
 
-def format_context_segment(cw, warn_pct=85.0):
+def format_context_segment(cw, warn_pct=85.0, term_width=120):
     if not isinstance(cw, dict):
         cw = {}
 
@@ -252,14 +266,16 @@ def format_context_segment(cw, warn_pct=85.0):
     else:
         color = GREEN
 
-    bar = make_bar(used_pct / 100.0, width=10)
+    bar_width = 5 if term_width < 90 else 10
+    bar = make_bar(used_pct / 100.0, width=bar_width)
     pct_str = f"{used_pct:.0f}%"
 
     detail = ""
-    if win_size > 0 and cur_tokens > 0:
-        detail = f" {DIM}({fmt_tokens(cur_tokens)}/{fmt_tokens(win_size)}){RESET}"
-    elif cur_tokens > 0:
-        detail = f" {DIM}({fmt_tokens(cur_tokens)}){RESET}"
+    if term_width >= 72:
+        if win_size > 0 and cur_tokens > 0:
+            detail = f" {DIM}({fmt_tokens(cur_tokens)}/{fmt_tokens(win_size)}){RESET}"
+        elif cur_tokens > 0:
+            detail = f" {DIM}({fmt_tokens(cur_tokens)}){RESET}"
 
     alert = f" {BOLD}{RED}⚠建议交接{RESET}" if used_pct >= warn_pct else ""
     return f"{DIM}上下文{RESET} {color}[{bar}] {pct_str}{RESET}{detail}{alert}"
@@ -388,7 +404,9 @@ def render(payload):
             if mname:
                 line1_parts.append(f"{mname}")
 
-    line1_parts.append(format_context_segment(payload.get("context_window"), warn_pct=warn_pct))
+    line1_parts.append(
+        format_context_segment(payload.get("context_window"), warn_pct=warn_pct, term_width=term_width)
+    )
     lines = [SEP.join(line1_parts)]
 
     quota_line = format_quota_line(payload.get("quota"), term_width=term_width)

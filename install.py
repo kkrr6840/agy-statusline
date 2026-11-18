@@ -63,7 +63,8 @@ def resolve_python_command():
     return f'"{which_py}"' if " " in which_py else which_py
 
 
-def format_statusline_command(script_path, py_exe=None):
+def format_statusline_command(script_path, py_exe=None, show_model=False):
+    extra_flag = " --show-model" if show_model else ""
     if os.name == "nt":
         raw_py = _win_short_path(py_exe if py_exe is not None else (sys.executable or "python"))
         raw_script = _win_short_path(script_path)
@@ -82,9 +83,9 @@ def format_statusline_command(script_path, py_exe=None):
             mod_name = os.path.splitext(script_name)[0] or "statusline"
             if script_dir:
                 env_prefixes.append(f"set PYTHONPATH={script_dir}")
-            cmd_core = f"{py_part} -m {mod_name}"
+            cmd_core = f"{py_part} -m {mod_name}{extra_flag}"
         else:
-            cmd_core = f"{py_part} {raw_script}"
+            cmd_core = f"{py_part} {raw_script}{extra_flag}"
 
         return "&&".join(env_prefixes + [cmd_core])
 
@@ -94,8 +95,8 @@ def format_statusline_command(script_path, py_exe=None):
     if script_path.startswith(home + os.sep):
         rel = "~/" + script_path[len(home) + 1 :].replace("\\", "/")
         if " " not in rel:
-            return f"{py_cmd} {rel}"
-    return f'{py_cmd} "{script_path}"'
+            return f"{py_cmd} {rel}{extra_flag}"
+    return f'{py_cmd} "{script_path}"{extra_flag}'
 
 
 def load_settings(settings_path):
@@ -170,11 +171,14 @@ def verify_script(script_path, command=None):
     return proc.stdout.strip()
 
 
-def install(agy_dir=None, stack_with_default=True):
+def install(agy_dir=None, stack_with_default=True, show_model=None):
     agy_dir = agy_dir or get_agy_dir()
     os.makedirs(agy_dir, exist_ok=True)
     target_script = os.path.join(agy_dir, "statusline.py")
     settings_path = os.path.join(agy_dir, "settings.json")
+
+    if show_model is None:
+        show_model = not stack_with_default
 
     script_bytes, source_desc = obtain_statusline_source()
     with open(target_script, "wb") as f:
@@ -182,7 +186,7 @@ def install(agy_dir=None, stack_with_default=True):
     if os.name != "nt":
         os.chmod(target_script, 0o755)
 
-    command = format_statusline_command(target_script)
+    command = format_statusline_command(target_script, show_model=bool(show_model))
     preview = verify_script(target_script, command=command)
 
     settings = load_settings(settings_path)
@@ -225,7 +229,21 @@ def main(argv=None):
     parser.add_argument(
         "--replace-default",
         action="store_true",
-        help="Replace agy's built-in status line instead of stacking below it",
+        help="Replace agy's built-in status line instead of stacking below it (enables --show-model by default)",
+    )
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument(
+        "--show-model",
+        dest="show_model",
+        action="store_true",
+        default=None,
+        help="Always include active model name on line 1",
+    )
+    model_group.add_argument(
+        "--no-show-model",
+        dest="show_model",
+        action="store_false",
+        help="Hide model name even when --replace-default is set",
     )
     parser.add_argument("--agy-dir", default=None, help="Override ~/.gemini/antigravity-cli directory")
     args = parser.parse_args(argv)
@@ -233,7 +251,11 @@ def main(argv=None):
     if args.uninstall:
         uninstall(agy_dir=args.agy_dir)
     else:
-        install(agy_dir=args.agy_dir, stack_with_default=not args.replace_default)
+        install(
+            agy_dir=args.agy_dir,
+            stack_with_default=not args.replace_default,
+            show_model=args.show_model,
+        )
 
 
 if __name__ == "__main__":
