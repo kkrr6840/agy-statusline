@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import re
@@ -31,9 +33,17 @@ class StatuslineTests(unittest.TestCase):
             statusline.format_dir(os.path.join(home, "Documents", "卜悦", "boyue-finance")),
             "~/…/卜悦/boyue-finance",
         )
+        self.assertEqual(
+            statusline.format_dir(os.path.join(home, "Documents", "deep", "app"), ascii_mode=True),
+            "~/.../deep/app",
+        )
         self.assertEqual(statusline.format_dir(r"D:\\"), "D:/")
         self.assertEqual(statusline.format_dir(r"D:\work\boyue"), "D:/work/boyue")
         self.assertEqual(statusline.format_dir(r"D:\work\company\boyue\app"), "D:/…/boyue/app")
+        self.assertEqual(
+            statusline.format_dir(r"D:\work\company\boyue\app", ascii_mode=True),
+            "D:/.../boyue/app",
+        )
 
     def test_render_full_payload_and_quotas(self):
         payload = {
@@ -57,7 +67,7 @@ class StatuslineTests(unittest.TestCase):
             },
             "terminal_width": 140,
         }
-        out = strip_ansi(statusline.render(payload))
+        out = strip_ansi(statusline.render(payload, lang="zh-CN", ascii_mode=False))
         lines = out.splitlines()
         self.assertEqual(len(lines), 2)
         self.assertIn("~/Projects/agy-statusline", lines[0])
@@ -80,7 +90,7 @@ class StatuslineTests(unittest.TestCase):
                 "current_usage": {"input_tokens": 904000},
             },
         }
-        out = strip_ansi(statusline.render(payload))
+        out = strip_ansi(statusline.render(payload, lang="zh-CN", ascii_mode=False))
         self.assertIn("~/…/卜悦/boyue-finance", out)
         self.assertIn("86%", out)
         self.assertIn("⚠建议交接", out)
@@ -98,15 +108,167 @@ class StatuslineTests(unittest.TestCase):
             },
             "terminal_width": 80,
         }
-        out = strip_ansi(statusline.render(payload))
+        out = strip_ansi(statusline.render(payload, lang="zh-CN", ascii_mode=False))
         self.assertIn("上下文 [██░░░] 40% (419k/1M)", out)
         self.assertIn("Gemini 5h 50%(1h)", out)
         self.assertNotIn("Gemini 5h [", out)
 
         ultra_narrow = dict(payload, terminal_width=68)
-        out_ultra = strip_ansi(statusline.render(ultra_narrow))
+        out_ultra = strip_ansi(statusline.render(ultra_narrow, lang="zh-CN", ascii_mode=False))
         self.assertIn("上下文 [██░░░] 40%", out_ultra)
         self.assertNotIn("(419k/1M)", out_ultra)
+
+    def test_all_five_languages_render_labels_and_handoff(self):
+        payload = {
+            "cwd": os.path.expanduser("~"),
+            "context_window": {
+                "used_percentage": 88.0,
+                "context_window_size": 1000000,
+                "current_usage": {"input_tokens": 880000},
+            },
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.80, "reset_in_seconds": 3600},
+                "gemini-weekly": {"remaining_fraction": 0.70, "reset_in_seconds": 86400},
+                "gemini-argon-wtu-weekly": {"remaining_fraction": 0.60, "reset_in_seconds": 86400},
+                "3p-weekly": {"remaining_fraction": 0.90, "reset_in_seconds": 86400},
+            },
+            "terminal_width": 140,
+        }
+        expectations = {
+            "en": ("Context [█████████░] 88%", "⚠handoff", "Quota  ", "wk [", "Argon wk [", "Claude/GPT wk ["),
+            "zh-CN": ("上下文 [█████████░] 88%", "⚠建议交接", "配额  ", "周 [", "Argon周 [", "Claude/GPT 周 ["),
+            "zh-TW": ("上下文 [█████████░] 88%", "⚠建議交接", "配額  ", "週 [", "Argon週 [", "Claude/GPT 週 ["),
+            "ja": ("コンテキスト [█████████░] 88%", "⚠引継ぎ推奨", "クォータ  ", "週 [", "Argon週 [", "Claude/GPT 週 ["),
+            "ko": ("컨텍스트 [█████████░] 88%", "⚠인계 권장", "할당량  ", "주간 [", "Argon주간 [", "Claude/GPT 주간 ["),
+        }
+        for lang, (ctx_lbl, alert_lbl, quota_lbl, wk_lbl, argon_lbl, tp_lbl) in expectations.items():
+            with self.subTest(lang=lang):
+                lines = strip_ansi(statusline.render(payload, lang=lang, ascii_mode=False)).splitlines()
+                self.assertEqual(len(lines), 2)
+                self.assertIn(ctx_lbl, lines[0])
+                self.assertIn(alert_lbl, lines[0])
+                self.assertTrue(lines[1].startswith(quota_lbl), lines[1])
+                self.assertIn(wk_lbl, lines[1])
+                self.assertIn(argon_lbl, lines[1])
+                self.assertIn(tp_lbl, lines[1])
+
+    def test_detect_lang_priority_and_unknown_locale_fallback(self):
+        # 1. --lang beats AGY_STATUSLINE_LANG and LC_ALL/LANG
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=["--lang", "ja"],
+                env={"AGY_STATUSLINE_LANG": "zh-CN", "LC_ALL": "ko_KR.UTF-8"},
+            ),
+            "ja",
+        )
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=["--lang=ko"],
+                env={"AGY_STATUSLINE_LANG": "zh-TW", "LANG": "en_US.UTF-8"},
+            ),
+            "ko",
+        )
+        # --lang auto defers to AGY_STATUSLINE_LANG
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=["--lang", "auto"],
+                env={"AGY_STATUSLINE_LANG": "zh-TW", "LC_ALL": "en_US.UTF-8"},
+            ),
+            "zh-TW",
+        )
+        # 2. AGY_STATUSLINE_LANG beats LC_ALL / LANG
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=[],
+                env={"AGY_STATUSLINE_LANG": "zh-CN", "LC_ALL": "ja_JP.UTF-8", "LANG": "en_US.UTF-8"},
+            ),
+            "zh-CN",
+        )
+        # AGY_STATUSLINE_LANG=auto defers to LC_ALL > LC_MESSAGES > LANGUAGE > LANG
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=[],
+                env={"AGY_STATUSLINE_LANG": "auto", "LC_ALL": "ja_JP.UTF-8", "LANG": "ko_KR.UTF-8"},
+            ),
+            "ja",
+        )
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=[],
+                env={"LC_MESSAGES": "ko_KR.UTF-8", "LANGUAGE": "ja:en", "LANG": "zh_CN.UTF-8"},
+            ),
+            "ko",
+        )
+        self.assertEqual(
+            statusline.detect_lang(
+                argv=[],
+                env={"LANGUAGE": ":zh_TW:ja", "LANG": "en_US.UTF-8"},
+            ),
+            "zh-TW",
+        )
+        # 3. Unknown explicit locales fall back cleanly to "en"
+        for unknown in ("fr_FR.UTF-8", "de_DE", "pt_BR", "es_ES@euro", "ru_RU.UTF-8"):
+            with self.subTest(locale=unknown):
+                self.assertEqual(statusline.detect_lang(argv=[], env={"LANG": unknown}), "en")
+        self.assertEqual(statusline.detect_lang(argv=["--lang", "fr"], env={"LANG": "zh_CN.UTF-8"}), "en")
+
+        # 4. Neutral locales return None in normalize_lang and fall back to "en" in isolated env
+        for neutral in ("", "C", "C.UTF-8", "POSIX", "auto"):
+            self.assertIsNone(statusline.normalize_lang(neutral))
+        self.assertEqual(statusline.detect_lang(argv=[], env={}), "en")
+        self.assertEqual(statusline.detect_lang(argv=[], env={"LANG": "C.UTF-8"}), "en")
+
+    def test_chinese_traditional_and_simplified_locale_variants(self):
+        for trad in ("zh_TW.UTF-8", "zh_HK.UTF-8", "zh_MO", "zh-Hant", "zh-Hant-HK", "zh-TW", "cht"):
+            with self.subTest(trad=trad):
+                self.assertEqual(statusline.normalize_lang(trad), "zh-TW")
+                self.assertEqual(statusline.detect_lang(argv=[], env={"LANG": trad}), "zh-TW")
+
+        for simp in ("zh", "zh_CN.UTF-8", "zh_SG", "zh-SG.UTF-8", "zh-Hans", "zh-Hans-CN", "zh-CN", "chs"):
+            with self.subTest(simp=simp):
+                self.assertEqual(statusline.normalize_lang(simp), "zh-CN")
+                self.assertEqual(statusline.detect_lang(argv=[], env={"LANG": simp}), "zh-CN")
+
+        self.assertEqual(statusline.normalize_lang("ja_JP.UTF-8"), "ja")
+        self.assertEqual(statusline.normalize_lang("jp"), "ja")
+        self.assertEqual(statusline.normalize_lang("ko_KR.UTF-8"), "ko")
+        self.assertEqual(statusline.normalize_lang("kr"), "ko")
+
+    def test_ascii_mode_detection_and_pure_ascii_output(self):
+        self.assertTrue(statusline.is_ascii_mode(argv=["--ascii"], env={}))
+        self.assertTrue(statusline.is_ascii_mode(argv=[], env={"AGY_STATUSLINE_ASCII": "1"}))
+        self.assertTrue(statusline.is_ascii_mode(argv=[], env={"TERM": "dumb"}))
+        self.assertFalse(statusline.is_ascii_mode(argv=[], env={"TERM": "xterm-256color"}))
+
+        # Use a non-existent ASCII path under ~ so vcs_payload branch fallback is exercised cleanly
+        ascii_dir = os.path.join(os.path.expanduser("~"), "nonexistent_dir_1", "deep_dir_2", "app")
+        # If ~ itself contains non-ASCII characters on a host, format_dir replaces ~ prefix with "~"
+        payload = {
+            "workspace": {"current_dir": ascii_dir},
+            "vcs": {"branch": "main", "dirty": True},
+            "context_window": {
+                "used_percentage": 88.0,
+                "context_window_size": 1048576,
+                "current_usage": {"input_tokens": 922746},
+            },
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.80, "reset_in_seconds": 3600},
+                "gemini-weekly": {"remaining_fraction": 0.60, "reset_in_seconds": 86400},
+                "3p-weekly": {"remaining_fraction": 1.0, "reset_in_seconds": 172800},
+            },
+            "terminal_width": 140,
+        }
+        raw_out = statusline.render(payload, lang="en", ascii_mode=True)
+        self.assertTrue(
+            all(ord(c) < 128 for c in raw_out),
+            f"Expected pure 7-bit ASCII output, got: {raw_out!r}",
+        )
+        clean = strip_ansi(raw_out)
+        self.assertIn("~/.../deep_dir_2/app", clean)
+        self.assertIn(" | git:main* | ", clean)
+        self.assertIn("Context [#########-] 88%", clean)
+        self.assertIn("!handoff", clean)
+        self.assertIn("Quota  Gemini 5h [####-] 80%(1h) / wk [###--] 60%(1d) | Claude/GPT wk [#####] 100%(2d)", clean)
 
     def test_git_branch_and_dirty_detection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,6 +295,8 @@ class StatuslineTests(unittest.TestCase):
                 f.write("dirty\n")
             seg_dirty = strip_ansi(statusline.get_git_segment(tmp, None))
             self.assertEqual(seg_dirty, "⎇ feat/hud*")
+            seg_dirty_ascii = strip_ansi(statusline.get_git_segment(tmp, None, ascii_mode=True))
+            self.assertEqual(seg_dirty_ascii, "git:feat/hud*")
 
     def test_install_preserves_existing_settings_and_uninstalls(self):
         with tempfile.TemporaryDirectory() as tmp_agy:
@@ -145,7 +309,8 @@ class StatuslineTests(unittest.TestCase):
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(original, f, ensure_ascii=False)
 
-            install.install(agy_dir=tmp_agy, stack_with_default=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.install(agy_dir=tmp_agy, stack_with_default=True)
             self.assertTrue(os.path.isfile(os.path.join(tmp_agy, "statusline.py")))
             self.assertTrue(os.path.isfile(settings_path + ".bak"))
 
@@ -158,7 +323,8 @@ class StatuslineTests(unittest.TestCase):
             if os.name == "nt":
                 self.assertNotIn('"', merged["statusLine"]["command"])
 
-            install.uninstall(agy_dir=tmp_agy)
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.uninstall(agy_dir=tmp_agy)
             with open(settings_path, "r", encoding="utf-8") as f:
                 restored = json.load(f)
             self.assertNotIn("statusLine", restored)
@@ -168,22 +334,83 @@ class StatuslineTests(unittest.TestCase):
     def test_install_works_in_directory_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp_root:
             spaced_agy = os.path.join(tmp_root, "dir with spaces", "antigravity-cli")
-            install.install(agy_dir=spaced_agy, stack_with_default=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.install(agy_dir=spaced_agy, stack_with_default=True)
             with open(os.path.join(spaced_agy, "settings.json"), "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             cmd = cfg["statusLine"]["command"]
             if os.name == "nt":
                 self.assertNotIn('"', cmd)
-            out = install.verify_script(os.path.join(spaced_agy, "statusline.py"), command=cmd)
-            self.assertIn("上下文", strip_ansi(out))
+            out = strip_ansi(install.verify_script(os.path.join(spaced_agy, "statusline.py"), command=cmd))
+            self.assertIn("12%", out)
+            self.assertIn("Gemini 5h", out)
 
     def test_replace_default_enables_show_model_automatically(self):
         with tempfile.TemporaryDirectory() as tmp_agy:
-            install.main(["--agy-dir", tmp_agy, "--replace-default"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.main(["--agy-dir", tmp_agy, "--replace-default"])
             with open(os.path.join(tmp_agy, "settings.json"), "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self.assertFalse(cfg["statusLine"]["stack_with_default"])
             self.assertIn("--show-model", cfg["statusLine"]["command"])
+
+    def test_install_lang_and_ascii_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp_agy:
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.main(["--agy-dir", tmp_agy, "--lang", "ja", "--ascii"])
+            with open(os.path.join(tmp_agy, "settings.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cmd = cfg["statusLine"]["command"]
+            self.assertIn("--lang ja", cmd)
+            self.assertIn("--ascii", cmd)
+            if os.name == "nt":
+                self.assertNotIn('"', cmd)
+
+            out_ja = strip_ansi(install.verify_script(os.path.join(tmp_agy, "statusline.py"), command=cmd))
+            self.assertIn("コンテキスト [#---------] 12%", out_ja)
+            self.assertIn("クォータ  Gemini 5h [####-] 88%(2h) / 週 [####-] 75%(4d)", out_ja)
+            self.assertNotIn("█", out_ja)
+            self.assertNotIn("│", out_ja)
+
+            # Verify --lang auto omits --lang flag while aliases normalize cleanly
+            script_path = os.path.join(tmp_agy, "statusline.py")
+            cmd_auto = install.format_statusline_command(script_path, lang="auto")
+            self.assertNotIn("--lang", cmd_auto)
+            self.assertIn("--lang zh-CN", install.format_statusline_command(script_path, lang="zh"))
+            self.assertIn("--lang zh-TW", install.format_statusline_command(script_path, lang="zh_HK"))
+            self.assertIn("--lang ko", install.format_statusline_command(script_path, lang="kr"))
+
+            # Verify end-to-end subprocess output for all 5 languages + English ASCII
+            expected_words = {
+                "en": ("Context", "Quota"),
+                "zh-CN": ("上下文", "配额"),
+                "zh-TW": ("上下文", "配額"),
+                "ja": ("コンテキスト", "クォータ"),
+                "ko": ("컨텍스트", "할당량"),
+            }
+            for lang_code, (ctx_word, quota_word) in expected_words.items():
+                with self.subTest(install_lang=lang_code):
+                    lang_cmd = install.format_statusline_command(script_path, lang=lang_code)
+                    rendered = strip_ansi(install.verify_script(script_path, command=lang_cmd))
+                    self.assertIn(ctx_word, rendered)
+                    self.assertIn(quota_word, rendered)
+
+            en_ascii_proc = subprocess.run(
+                [sys.executable, script_path, "--lang", "en", "--ascii"],
+                input=json.dumps(
+                    {
+                        "workspace": {"current_dir": os.path.expanduser("~")},
+                        "context_window": {"used_percentage": 90.0, "context_window_size": 100000},
+                        "quota": {"gemini-weekly": {"remaining_fraction": 0.5, "reset_in_seconds": 3600}},
+                    }
+                ),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            self.assertTrue(all(ord(c) < 128 for c in en_ascii_proc.stdout), en_ascii_proc.stdout)
+            self.assertIn("!handoff", strip_ansi(en_ascii_proc.stdout))
 
     def test_windows_fallback_when_short_path_unavailable(self):
         if os.name != "nt":
@@ -198,10 +425,11 @@ class StatuslineTests(unittest.TestCase):
             orig_short = install._win_short_path
             try:
                 install._win_short_path = lambda p: p
-                cmd = install.format_statusline_command(target)
+                cmd = install.format_statusline_command(target, lang="zh-CN")
                 self.assertNotIn('"', cmd)
-                out = install.verify_script(target, command=cmd)
-                self.assertIn("上下文", strip_ansi(out))
+                out = strip_ansi(install.verify_script(target, command=cmd))
+                self.assertIn("上下文", out)
+                self.assertIn("12%", out)
             finally:
                 install._win_short_path = orig_short
 

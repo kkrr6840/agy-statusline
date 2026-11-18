@@ -3,6 +3,7 @@
 
 Can run directly from a cloned repo:
     python3 install.py
+    python3 install.py --lang ja --ascii
     python3 install.py --uninstall
 
 Or piped directly from GitHub on a new machine:
@@ -12,6 +13,7 @@ Or piped directly from GitHub on a new machine:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,9 +29,46 @@ RAW_SCRIPT_URL = (
     or "https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/statusline.py"
 )
 
+_LOCALE_TAG_RE = re.compile(r"^[a-z]{2,3}(?:-[a-z0-9]{1,8})*$")
+
 
 def get_agy_dir():
     return os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
+
+
+def normalize_lang_option(raw):
+    """Normalize --lang CLI/API option to canonical code, or None for runtime auto-detection."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"Invalid language option: {raw!r}")
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    s = stripped.split("@", 1)[0].split(".", 1)[0].strip().lower().replace("_", "-")
+    if s in ("", "auto"):
+        return None
+
+    if s in ("zh-tw", "zh-hk", "zh-mo", "zh-hant", "cht", "zh-cht") or s.startswith(
+        ("zh-hant-", "zh-tw-", "zh-hk-", "zh-mo-")
+    ):
+        return "zh-TW"
+    if s in ("zh", "zh-cn", "zh-sg", "zh-hans", "chs", "zh-chs") or s.startswith("zh-"):
+        return "zh-CN"
+    if s in ("ja", "jp") or s.startswith("ja-"):
+        return "ja"
+    if s in ("ko", "kr") or s.startswith("ko-"):
+        return "ko"
+    if s == "en" or s.startswith("en-"):
+        return "en"
+
+    if _LOCALE_TAG_RE.match(s):
+        sys.stderr.write(f"Note: language '{stripped}' is not localized; falling back to 'en'.\n")
+        return "en"
+
+    raise ValueError(
+        f"Invalid --lang value {raw!r} (expected one of: en, zh-CN, zh-TW, ja, ko, auto)"
+    )
 
 
 def _win_short_path(path):
@@ -63,8 +102,17 @@ def resolve_python_command():
     return f'"{which_py}"' if " " in which_py else which_py
 
 
-def format_statusline_command(script_path, py_exe=None, show_model=False):
-    extra_flag = " --show-model" if show_model else ""
+def format_statusline_command(script_path, py_exe=None, show_model=False, lang=None, ascii_mode=False):
+    norm_lang = normalize_lang_option(lang)
+    flags = []
+    if show_model:
+        flags.append("--show-model")
+    if norm_lang:
+        flags.append(f"--lang {norm_lang}")
+    if ascii_mode:
+        flags.append("--ascii")
+    extra_flag = (" " + " ".join(flags)) if flags else ""
+
     if os.name == "nt":
         raw_py = _win_short_path(py_exe if py_exe is not None else (sys.executable or "python"))
         raw_script = _win_short_path(script_path)
@@ -171,7 +219,7 @@ def verify_script(script_path, command=None):
     return proc.stdout.strip()
 
 
-def install(agy_dir=None, stack_with_default=True, show_model=None):
+def install(agy_dir=None, stack_with_default=True, show_model=None, lang=None, ascii_mode=False):
     agy_dir = agy_dir or get_agy_dir()
     os.makedirs(agy_dir, exist_ok=True)
     target_script = os.path.join(agy_dir, "statusline.py")
@@ -180,13 +228,20 @@ def install(agy_dir=None, stack_with_default=True, show_model=None):
     if show_model is None:
         show_model = not stack_with_default
 
+    norm_lang = normalize_lang_option(lang)
+
     script_bytes, source_desc = obtain_statusline_source()
     with open(target_script, "wb") as f:
         f.write(script_bytes)
     if os.name != "nt":
         os.chmod(target_script, 0o755)
 
-    command = format_statusline_command(target_script, show_model=bool(show_model))
+    command = format_statusline_command(
+        target_script,
+        show_model=bool(show_model),
+        lang=norm_lang,
+        ascii_mode=bool(ascii_mode),
+    )
     preview = verify_script(target_script, command=command)
 
     settings = load_settings(settings_path)
@@ -245,8 +300,24 @@ def main(argv=None):
         action="store_false",
         help="Hide model name even when --replace-default is set",
     )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="Pin HUD language (en, zh-CN, zh-TW, ja, ko, or auto)",
+    )
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        help="Use pure ASCII symbols instead of Unicode glyphs",
+    )
     parser.add_argument("--agy-dir", default=None, help="Override ~/.gemini/antigravity-cli directory")
     args = parser.parse_args(argv)
+
+    try:
+        norm_lang = normalize_lang_option(args.lang)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return
 
     if args.uninstall:
         uninstall(agy_dir=args.agy_dir)
@@ -255,6 +326,8 @@ def main(argv=None):
             agy_dir=args.agy_dir,
             stack_with_default=not args.replace_default,
             show_model=args.show_model,
+            lang=norm_lang,
+            ascii_mode=args.ascii,
         )
 
 
