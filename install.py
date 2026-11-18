@@ -199,6 +199,7 @@ def verify_script(script_path, command=None):
                 "gemini-5h": {"remaining_fraction": 0.88, "reset_in_seconds": 7200},
                 "gemini-weekly": {"remaining_fraction": 0.75, "reset_in_seconds": 345600},
             },
+            "terminal_width": 120,
         }
     )
     if command:

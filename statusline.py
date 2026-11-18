@@ -15,8 +15,10 @@ import datetime
 import json
 import locale
 import os
+import re
 import subprocess
 import sys
+import unicodedata
 
 # Ensure UTF-8 I/O even under Windows cmd.exe (GBK/cp936) pipes
 if hasattr(sys.stdin, "reconfigure"):
@@ -37,6 +39,109 @@ MAGENTA = "" if NO_COLOR else "\033[35m"
 
 SEP = f" {DIM}│{RESET} "
 ASCII_SEP = f" {DIM}|{RESET} "
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def display_width(text):
+    """Return terminal column width of a string (ANSI stripped, CJK wide=2)."""
+    if not text:
+        return 0
+    clean = _ANSI_RE.sub("", text)
+    width = 0
+    for ch in clean:
+        if unicodedata.combining(ch):
+            continue
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def detect_terminal_width(payload=None, env=None, use_tty=None, fallback=120):
+    """Resolve live terminal/pane column width even when stdin/stdout are pipes."""
+    if isinstance(payload, dict):
+        ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
+        for candidate in (
+            payload.get("terminal_width"),
+            payload.get("columns"),
+            payload.get("cols"),
+            payload.get("width"),
+            ws.get("terminal_width"),
+            ws.get("columns"),
+        ):
+            if candidate is not None:
+                try:
+                    val = int(candidate)
+                    if val > 0:
+                        return val
+                except (TypeError, ValueError):
+                    pass
+
+    if use_tty is None:
+        use_tty = env is None or env is os.environ
+    env = os.environ if env is None else env
+
+    override = env.get("AGY_STATUSLINE_WIDTH")
+    if override:
+        try:
+            val = int(override)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+
+    if use_tty:
+        for stream in (sys.stdout, sys.stderr, sys.stdin):
+            try:
+                if stream is not None and hasattr(stream, "isatty") and stream.isatty():
+                    cols = os.get_terminal_size(stream.fileno()).columns
+                    if cols > 0:
+                        return cols
+            except Exception:
+                pass
+
+        if os.name == "nt":
+            fd = None
+            try:
+                fd = os.open("CONOUT$", os.O_RDWR)
+                cols = os.get_terminal_size(fd).columns
+                if cols > 0:
+                    return cols
+            except Exception:
+                pass
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        else:
+            fd = None
+            try:
+                fd = os.open("/dev/tty", os.O_RDONLY | getattr(os, "O_NOCTTY", 0))
+                cols = os.get_terminal_size(fd).columns
+                if cols > 0:
+                    return cols
+            except Exception:
+                pass
+            finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    env_cols = env.get("COLUMNS")
+    if env_cols:
+        try:
+            val = int(env_cols)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+
+    return fallback
 
 MESSAGES = {
     "en": {
@@ -419,7 +524,15 @@ def get_git_segment(target_dir, vcs_payload, ascii_mode=False):
     return f"{color}{branch_prefix}{branch}{marks}{sync}{RESET}"
 
 
-def format_context_segment(cw, warn_pct=85.0, term_width=120, lang="en", ascii_mode=False):
+def format_context_segment(
+    cw,
+    warn_pct=85.0,
+    term_width=120,
+    lang="en",
+    ascii_mode=False,
+    bar_width=None,
+    show_detail=None,
+):
     if not isinstance(cw, dict):
         cw = {}
 
@@ -452,12 +565,16 @@ def format_context_segment(cw, warn_pct=85.0, term_width=120, lang="en", ascii_m
     else:
         color = GREEN
 
-    bar_width = 5 if term_width < 90 else 10
+    if bar_width is None:
+        bar_width = 5 if term_width < 90 else 10
+    if show_detail is None:
+        show_detail = term_width >= 72
+
     bar = make_bar(used_pct / 100.0, width=bar_width, ascii_mode=ascii_mode)
     pct_str = f"{used_pct:.0f}%"
 
     detail = ""
-    if term_width >= 72:
+    if show_detail:
         if win_size > 0 and cur_tokens > 0:
             detail = f" {DIM}({fmt_tokens(cur_tokens)}/{fmt_tokens(win_size)}){RESET}"
         elif cur_tokens > 0:
@@ -484,7 +601,7 @@ def resolve_reset_seconds(bucket):
         return None
 
 
-def fmt_quota_item(label, bucket, show_bar=True, ascii_mode=False):
+def fmt_quota_item(label, bucket, bar_width=5, show_duration=True, ascii_mode=False):
     if not isinstance(bucket, dict) or bucket.get("disabled") is True:
         return None
     rem = bucket.get("remaining_fraction")
@@ -503,20 +620,15 @@ def fmt_quota_item(label, bucket, show_bar=True, ascii_mode=False):
     else:
         color = GREEN
 
-    bar_part = f"[{make_bar(rem_f, width=5, ascii_mode=ascii_mode)}] " if show_bar else ""
-    dur = fmt_duration(resolve_reset_seconds(bucket))
+    if isinstance(bar_width, bool):
+        bar_width = 5 if bar_width else 0
+    bar_part = f"[{make_bar(rem_f, width=bar_width, ascii_mode=ascii_mode)}] " if bar_width > 0 else ""
+    dur = fmt_duration(resolve_reset_seconds(bucket)) if show_duration else ""
     dur_part = f"{DIM}({dur}){RESET}" if dur else ""
     return f"{label} {color}{bar_part}{pct}%{RESET}{dur_part}"
 
 
-def format_quota_line(quota, term_width=120, lang="en", ascii_mode=False):
-    if not isinstance(quota, dict) or not quota:
-        return ""
-
-    msg = _get_messages(lang)
-    sep = ASCII_SEP if ascii_mode else SEP
-    dot_sep = f" {DIM}/{RESET} " if ascii_mode else f" {DIM}·{RESET} "
-    show_bar = term_width >= 105
+def _build_quota_groups(quota, msg, dot_sep, bar_width=5, show_duration=True, ascii_mode=False):
     groups = []
 
     gemini_items = []
@@ -525,7 +637,9 @@ def format_quota_line(quota, term_width=120, lang="en", ascii_mode=False):
         ("gemini-weekly", msg["weekly"]),
         ("gemini-argon-wtu-weekly", msg["argon_weekly"]),
     ):
-        rendered = fmt_quota_item(label, quota.get(key), show_bar=show_bar, ascii_mode=ascii_mode)
+        rendered = fmt_quota_item(
+            label, quota.get(key), bar_width=bar_width, show_duration=show_duration, ascii_mode=ascii_mode
+        )
         if rendered:
             gemini_items.append(rendered)
     if gemini_items:
@@ -533,7 +647,9 @@ def format_quota_line(quota, term_width=120, lang="en", ascii_mode=False):
 
     tp_items = []
     for key, label in (("3p-5h", "5h"), ("3p-weekly", msg["weekly"])):
-        rendered = fmt_quota_item(label, quota.get(key), show_bar=show_bar, ascii_mode=ascii_mode)
+        rendered = fmt_quota_item(
+            label, quota.get(key), bar_width=bar_width, show_duration=show_duration, ascii_mode=ascii_mode
+        )
         if rendered:
             tp_items.append(rendered)
     if tp_items:
@@ -550,15 +666,69 @@ def format_quota_line(quota, term_width=120, lang="en", ascii_mode=False):
     for key in sorted(quota.keys()):
         if key in known:
             continue
-        rendered = fmt_quota_item(key, quota.get(key), show_bar=False, ascii_mode=ascii_mode)
+        rendered = fmt_quota_item(key, quota.get(key), bar_width=0, show_duration=show_duration, ascii_mode=ascii_mode)
         if rendered:
             extra_items.append(rendered)
     if extra_items:
         groups.append(dot_sep.join(extra_items))
 
+    return groups
+
+
+def format_quota_line(quota, term_width=120, lang="en", ascii_mode=False):
+    if not isinstance(quota, dict) or not quota:
+        return ""
+
+    msg = _get_messages(lang)
+    sep = ASCII_SEP if ascii_mode else SEP
+    dot_sep = f" {DIM}/{RESET} " if ascii_mode else f" {DIM}·{RESET} "
+    prefix = f"{DIM}{msg['quota']}{RESET}  "
+    avail_width = max(40, term_width - 2)
+
+    # Progressive single-line tiers: 5-cell bars -> 3-cell bars -> no bars
+    candidate_bars = []
+    if term_width >= 105:
+        candidate_bars.extend([5, 3, 0])
+    elif term_width >= 95:
+        candidate_bars.extend([3, 0])
+    else:
+        candidate_bars.append(0)
+
+    no_bar_groups = None
+    for bw in candidate_bars:
+        groups = _build_quota_groups(quota, msg, dot_sep, bar_width=bw, show_duration=True, ascii_mode=ascii_mode)
+        if not groups:
+            return ""
+        if bw == 0:
+            no_bar_groups = groups
+        line = prefix + sep.join(groups)
+        if display_width(line) <= avail_width:
+            return line
+
+    # Narrow split-pane fallback (e.g. cmux/tmux side-by-side panes): stack provider groups vertically
+    groups = no_bar_groups or _build_quota_groups(
+        quota, msg, dot_sep, bar_width=0, show_duration=True, ascii_mode=ascii_mode
+    )
     if not groups:
         return ""
-    return f"{DIM}{msg['quota']}{RESET}  " + sep.join(groups)
+
+    if len(groups) == 1:
+        compact_groups = _build_quota_groups(
+            quota, msg, dot_sep, bar_width=0, show_duration=False, ascii_mode=ascii_mode
+        )
+        return prefix + sep.join(compact_groups)
+
+    indent_cols = display_width(prefix) if term_width >= 58 else 2
+    indent = " " * indent_cols
+    stacked_lines = [prefix + groups[0]] + [indent + g for g in groups[1:]]
+    if all(display_width(ln) <= avail_width for ln in stacked_lines):
+        return "\n".join(stacked_lines)
+
+    # Ultra-narrow fallback: stacked groups without reset countdowns
+    compact_groups = _build_quota_groups(
+        quota, msg, dot_sep, bar_width=0, show_duration=False, ascii_mode=ascii_mode
+    )
+    return "\n".join([prefix + compact_groups[0]] + [indent + g for g in compact_groups[1:]])
 
 
 def render(payload, lang=None, ascii_mode=None):
@@ -579,11 +749,8 @@ def render(payload, lang=None, ascii_mode=None):
 
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
     raw_dir = ws.get("current_dir") or payload.get("cwd") or os.getcwd()
-    term_width = payload.get("terminal_width") or 120
-    try:
-        term_width = int(term_width)
-    except (TypeError, ValueError):
-        term_width = 120
+    term_width = detect_terminal_width(payload)
+    avail_width = max(40, term_width - 2)
 
     warn_pct = 85.0
     env_warn = os.environ.get("AGY_STATUSLINE_WARN_PCT")
@@ -593,29 +760,54 @@ def render(payload, lang=None, ascii_mode=None):
         except ValueError:
             pass
 
-    line1_parts = [f"{CYAN}{format_dir(raw_dir, ascii_mode=resolved_ascii)}{RESET}"]
+    prefix_parts = [f"{CYAN}{format_dir(raw_dir, ascii_mode=resolved_ascii)}{RESET}"]
 
     git_seg = get_git_segment(raw_dir, payload.get("vcs"), ascii_mode=resolved_ascii)
     if git_seg:
-        line1_parts.append(git_seg)
+        prefix_parts.append(git_seg)
 
     if os.environ.get("AGY_STATUSLINE_SHOW_MODEL") == "1" or "--show-model" in sys.argv[1:]:
         model_obj = payload.get("model")
         if isinstance(model_obj, dict):
             mname = model_obj.get("display_name") or model_obj.get("id")
             if mname:
-                line1_parts.append(f"{mname}")
+                prefix_parts.append(f"{mname}")
 
-    line1_parts.append(
-        format_context_segment(
-            payload.get("context_window"),
-            warn_pct=warn_pct,
-            term_width=term_width,
-            lang=resolved_lang,
-            ascii_mode=resolved_ascii,
-        )
+    cw_obj = payload.get("context_window")
+    line1 = sep.join(
+        prefix_parts
+        + [
+            format_context_segment(
+                cw_obj,
+                warn_pct=warn_pct,
+                term_width=term_width,
+                lang=resolved_lang,
+                ascii_mode=resolved_ascii,
+            )
+        ]
     )
-    lines = [sep.join(line1_parts)]
+    if display_width(line1) > avail_width:
+        # Shrink context bar to 5 cells first, then drop token count detail if still wider than pane
+        for bw, show_det in ((5, True), (5, False)):
+            candidate = sep.join(
+                prefix_parts
+                + [
+                    format_context_segment(
+                        cw_obj,
+                        warn_pct=warn_pct,
+                        term_width=term_width,
+                        lang=resolved_lang,
+                        ascii_mode=resolved_ascii,
+                        bar_width=bw,
+                        show_detail=show_det,
+                    )
+                ]
+            )
+            line1 = candidate
+            if display_width(line1) <= avail_width:
+                break
+
+    lines = [line1]
 
     quota_line = format_quota_line(
         payload.get("quota"),

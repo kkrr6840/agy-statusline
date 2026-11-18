@@ -118,6 +118,78 @@ class StatuslineTests(unittest.TestCase):
         self.assertIn("上下文 [██░░░] 40%", out_ultra)
         self.assertNotIn("(419k/1M)", out_ultra)
 
+    def test_cmux_four_quotas_progressive_width_adaptation(self):
+        # Exact 4-bucket payload from real cmux split-pane usage
+        payload = {
+            "cwd": os.path.expanduser("~"),
+            "context_window": {
+                "used_percentage": 7.0,
+                "context_window_size": 1048576,
+                "current_usage": {"input_tokens": 74000},
+            },
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.37, "reset_in_seconds": 720},
+                "gemini-weekly": {"remaining_fraction": 0.78, "reset_in_seconds": 568800},
+                "3p-5h": {"remaining_fraction": 1.0, "reset_in_seconds": 17760},
+                "3p-weekly": {"remaining_fraction": 1.0, "reset_in_seconds": 568800},
+            },
+        }
+        # 1. Wide pane (130 cols): full 5-cell bars, single quota line, fits within width
+        wide = statusline.render(dict(payload, terminal_width=130), lang="zh-CN", ascii_mode=False).splitlines()
+        self.assertEqual(len(wide), 2)
+        self.assertIn("[██░░░] 37%(12m)", strip_ansi(wide[1]))
+        self.assertTrue(strip_ansi(wide[1]).endswith("100%(6d14h)"))
+        self.assertLessEqual(statusline.display_width(wide[1]), 128)
+
+        # 2. Medium cmux pane (112 cols): auto-shrinks to 3-cell bars so 100%(6d14h) is never clipped
+        medium = statusline.render(dict(payload, terminal_width=112), lang="zh-CN", ascii_mode=False).splitlines()
+        self.assertEqual(len(medium), 2)
+        self.assertIn("[█░░] 37%(12m)", strip_ansi(medium[1]))
+        self.assertTrue(strip_ansi(medium[1]).endswith("100%(6d14h)"))
+        self.assertLessEqual(statusline.display_width(medium[1]), 110)
+
+        # 3. Compact pane (96 cols): drops mini-bars, keeps all % and countdowns on one line
+        compact = statusline.render(dict(payload, terminal_width=96), lang="zh-CN", ascii_mode=False).splitlines()
+        self.assertEqual(len(compact), 2)
+        self.assertNotIn("Gemini 5h [", strip_ansi(compact[1]))
+        self.assertTrue(strip_ansi(compact[1]).endswith("100%(6d14h)"))
+        self.assertLessEqual(statusline.display_width(compact[1]), 94)
+
+        # 4. Narrow side-by-side cmux split (76 cols): stacks Gemini and Claude/GPT onto separate lines
+        narrow = statusline.render(dict(payload, terminal_width=76), lang="zh-CN", ascii_mode=False).splitlines()
+        self.assertEqual(len(narrow), 3)
+        self.assertIn("Gemini 5h 37%(12m)", strip_ansi(narrow[1]))
+        self.assertIn("Claude/GPT 5h 100%(4h56m)", strip_ansi(narrow[2]))
+        self.assertTrue(strip_ansi(narrow[2]).endswith("100%(6d14h)"))
+        for ln in narrow:
+            self.assertLessEqual(statusline.display_width(ln), 74)
+
+    def test_detect_terminal_width_priority(self):
+        self.assertEqual(
+            statusline.detect_terminal_width(
+                {"terminal_width": 108},
+                env={"AGY_STATUSLINE_WIDTH": "90", "COLUMNS": "80"},
+                use_tty=False,
+            ),
+            108,
+        )
+        self.assertEqual(
+            statusline.detect_terminal_width(
+                {},
+                env={"AGY_STATUSLINE_WIDTH": "92", "COLUMNS": "80"},
+                use_tty=False,
+            ),
+            92,
+        )
+        self.assertEqual(
+            statusline.detect_terminal_width({}, env={"COLUMNS": "84"}, use_tty=False),
+            84,
+        )
+        self.assertEqual(
+            statusline.detect_terminal_width({}, env={}, use_tty=False, fallback=120),
+            120,
+        )
+
     def test_all_five_languages_render_labels_and_handoff(self):
         payload = {
             "cwd": os.path.expanduser("~"),
