@@ -21,10 +21,12 @@ import sys
 import unicodedata
 
 # Ensure UTF-8 I/O even under Windows cmd.exe (GBK/cp936) pipes
-if hasattr(sys.stdin, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+for _stream in (sys.stdin, sys.stdout):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
 
@@ -839,7 +841,10 @@ def main():
 
     out = render(payload)
     if out:
-        sys.stdout.write(out + "\n")
+        try:
+            sys.stdout.write(out + "\n")
+        except BrokenPipeError:
+            pass
 
 
 if __name__ == "__main__":

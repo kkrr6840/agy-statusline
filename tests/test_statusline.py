@@ -385,6 +385,8 @@ class StatuslineTests(unittest.TestCase):
                 install.install(agy_dir=tmp_agy, stack_with_default=True)
             self.assertTrue(os.path.isfile(os.path.join(tmp_agy, "statusline.py")))
             self.assertTrue(os.path.isfile(settings_path + ".bak"))
+            if os.name == "nt":
+                self.assertTrue(os.path.isfile(os.path.join(tmp_agy, "statusline.cmd")))
 
             with open(settings_path, "r", encoding="utf-8") as f:
                 merged = json.load(f)
@@ -402,6 +404,8 @@ class StatuslineTests(unittest.TestCase):
             self.assertNotIn("statusLine", restored)
             self.assertEqual(restored["model"], "Gemini 4 Carbon (High)")
             self.assertFalse(os.path.exists(os.path.join(tmp_agy, "statusline.py")))
+            if os.name == "nt":
+                self.assertFalse(os.path.exists(os.path.join(tmp_agy, "statusline.cmd")))
 
     def test_install_works_in_directory_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp_root:
@@ -494,14 +498,86 @@ class StatuslineTests(unittest.TestCase):
             with open(os.path.join(REPO_ROOT, "statusline.py"), "rb") as src, open(target, "wb") as dst:
                 dst.write(src.read())
 
+            hostile_env = dict(
+                os.environ,
+                PATH=r"C:\Windows\System32;C:\Bad\A&B;C:\Bad\C|D;" + os.environ.get("PATH", ""),
+            )
             orig_short = install._win_short_path
             try:
                 install._win_short_path = lambda p: p
                 cmd = install.format_statusline_command(target, lang="zh-CN")
                 self.assertNotIn('"', cmd)
-                out = strip_ansi(install.verify_script(target, command=cmd))
+                self.assertNotIn("set PATH=", cmd)
+                out = strip_ansi(install.verify_script(target, command=cmd, env=hostile_env))
                 self.assertIn("上下文", out)
                 self.assertIn("12%", out)
+            finally:
+                install._win_short_path = orig_short
+
+    def test_windows_launcher_hostile_path_and_special_dir_chars(self):
+        if os.name != "nt":
+            return
+        with tempfile.TemporaryDirectory() as tmp_root:
+            special_agy = os.path.join(tmp_root, "测试 (x86) & spaces", "antigravity-cli")
+            orig_short = install._win_short_path
+            try:
+                install._win_short_path = lambda p: p
+                with contextlib.redirect_stdout(io.StringIO()):
+                    install.main(["--agy-dir", special_agy, "--lang", "zh-CN", "--ascii"])
+            finally:
+                install._win_short_path = orig_short
+
+            launcher_path = os.path.join(special_agy, "statusline.cmd")
+            self.assertTrue(os.path.isfile(launcher_path))
+            with open(os.path.join(special_agy, "settings.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cmd = cfg["statusLine"]["command"]
+            self.assertNotIn('"', cmd)
+            self.assertNotIn("set PATH=", cmd)
+
+            hostile_env = dict(
+                os.environ,
+                PATH=r"C:\Windows\System32;C:\Bad\A&B;C:\Bad\C|D;" + os.environ.get("PATH", ""),
+            )
+            out = strip_ansi(
+                install.verify_script(os.path.join(special_agy, "statusline.py"), command=cmd, env=hostile_env)
+            )
+            self.assertIn("上下文", out)
+            self.assertIn("配额", out)
+            self.assertIn("12%", out)
+
+    def test_windows_launcher_non_ascii_python_emits_chcp(self):
+        if os.name != "nt":
+            return
+        with tempfile.TemporaryDirectory() as tmp_root:
+            script_path = os.path.join(tmp_root, "statusline.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write("# stub\n")
+
+            orig_short = install._win_short_path
+            try:
+                install._win_short_path = lambda p: p
+                ascii_cmd = install.write_windows_launcher(
+                    script_path, py_exe=r"C:\Program Files\Python312\python.exe"
+                )
+                with open(ascii_cmd, "rb") as f:
+                    ascii_bytes = f.read()
+                self.assertFalse(ascii_bytes.startswith(b"\xef\xbb\xbf"))
+                self.assertIn(b"\r\n", ascii_bytes)
+                ascii_text = ascii_bytes.decode("utf-8")
+                self.assertNotIn("chcp 65001", ascii_text)
+                self.assertIn(r'"C:\Program Files\Python312\python.exe" "%~dp0statusline.py" %*', ascii_text)
+
+                non_ascii_cmd = install.write_windows_launcher(
+                    script_path, py_exe=r"C:\Users\测试\Python312\python.exe"
+                )
+                with open(non_ascii_cmd, "rb") as f:
+                    non_ascii_bytes = f.read()
+                self.assertFalse(non_ascii_bytes.startswith(b"\xef\xbb\xbf"))
+                self.assertIn(b"\r\n", non_ascii_bytes)
+                non_ascii_text = non_ascii_bytes.decode("utf-8")
+                self.assertIn("chcp 65001 >nul 2>nul", non_ascii_text)
+                self.assertIn(r'"C:\Users\测试\Python312\python.exe" "%~dp0statusline.py" %*', non_ascii_text)
             finally:
                 install._win_short_path = orig_short
 

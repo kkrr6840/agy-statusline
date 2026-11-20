@@ -87,6 +87,56 @@ def _win_short_path(path):
     return path
 
 
+def _escape_cmd_token(value):
+    """Escape cmd.exe metacharacters and spaces with ^ for an unquoted executable token."""
+    out = []
+    for ch in value:
+        if ch in " &()^!|<>,;=":
+            out.append("^" + ch)
+        elif ch == "%":
+            out.append("%%")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _escape_cmd_set_value(value):
+    """Escape cmd.exe metacharacters inside `set VAR=...` without escaping spaces."""
+    out = []
+    for ch in value:
+        if ch in "&|<>^":
+            out.append("^" + ch)
+        elif ch == "%":
+            out.append("%%")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def write_windows_launcher(script_path, py_exe=None):
+    """Generate a sibling statusline.cmd wrapper so agy cmd /c avoids inline quoting/PATH hazards."""
+    launcher_path = os.path.splitext(script_path)[0] + ".cmd"
+    raw_py = _win_short_path(py_exe if py_exe is not None else (sys.executable or "python"))
+    py_bat = raw_py.replace("%", "%%")
+    script_bat = os.path.basename(script_path).replace("%", "%%")
+
+    lines = [
+        "@echo off",
+        "setlocal",
+    ]
+    if not raw_py.isascii():
+        lines.append("chcp 65001 >nul 2>nul")
+    lines.extend(
+        [
+            'set "PYTHONUTF8=1"',
+            f'"{py_bat}" "%~dp0{script_bat}" %*',
+        ]
+    )
+    with open(launcher_path, "w", encoding="utf-8", newline="") as f:
+        f.write("\r\n".join(lines) + "\r\n")
+    return launcher_path
+
+
 def resolve_python_command():
     """Choose a stable Python executable path for settings.json."""
     if os.name == "nt":
@@ -102,7 +152,14 @@ def resolve_python_command():
     return f'"{which_py}"' if " " in which_py else which_py
 
 
-def format_statusline_command(script_path, py_exe=None, show_model=False, lang=None, ascii_mode=False):
+def format_statusline_command(
+    script_path,
+    py_exe=None,
+    show_model=False,
+    lang=None,
+    ascii_mode=False,
+    launcher_path=None,
+):
     norm_lang = normalize_lang_option(lang)
     flags = []
     if show_model:
@@ -114,28 +171,27 @@ def format_statusline_command(script_path, py_exe=None, show_model=False, lang=N
     extra_flag = (" " + " ".join(flags)) if flags else ""
 
     if os.name == "nt":
+        effective_launcher = launcher_path
+        if effective_launcher is None and py_exe is None:
+            candidate = os.path.splitext(script_path)[0] + ".cmd"
+            if os.path.isfile(candidate):
+                effective_launcher = candidate
+
+        if effective_launcher:
+            short_launcher = _win_short_path(effective_launcher)
+            return f"{_escape_cmd_token(short_launcher)}{extra_flag}"
+
         raw_py = _win_short_path(py_exe if py_exe is not None else (sys.executable or "python"))
         raw_script = _win_short_path(script_path)
+        py_part = _escape_cmd_token(raw_py)
 
-        env_prefixes = []
-        if " " in raw_py:
-            py_dir, py_name = os.path.split(raw_py)
-            if py_dir:
-                env_prefixes.append(f"set PATH={py_dir};%PATH%")
-            py_part = py_name or "python"
-        else:
-            py_part = raw_py
-
-        if " " in raw_script:
+        if any(ch in raw_script for ch in " &()^!|<>,;=%"):
             script_dir, script_name = os.path.split(raw_script)
             mod_name = os.path.splitext(script_name)[0] or "statusline"
             if script_dir:
-                env_prefixes.append(f"set PYTHONPATH={script_dir}")
-            cmd_core = f"{py_part} -m {mod_name}{extra_flag}"
-        else:
-            cmd_core = f"{py_part} {raw_script}{extra_flag}"
-
-        return "&&".join(env_prefixes + [cmd_core])
+                return f"set PYTHONPATH={_escape_cmd_set_value(script_dir)}&&{py_part} -m {mod_name}{extra_flag}"
+            return f"{py_part} -m {mod_name}{extra_flag}"
+        return f"{py_part} {raw_script}{extra_flag}"
 
     py_cmd = resolve_python_command() if py_exe is None else (f'"{py_exe}"' if " " in py_exe else py_exe)
     # Use ~ on POSIX so settings.json stays clean and portable across home paths
@@ -186,7 +242,7 @@ def obtain_statusline_source():
     return content, RAW_SCRIPT_URL
 
 
-def verify_script(script_path, command=None):
+def verify_script(script_path, command=None, env=None):
     sample = json.dumps(
         {
             "workspace": {"current_dir": os.getcwd()},
@@ -214,13 +270,26 @@ def verify_script(script_path, command=None):
         encoding="utf-8",
         errors="replace",
         timeout=5,
+        env=env,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
-        raise RuntimeError(f"Smoke test failed (exit {proc.returncode}): {proc.stderr}")
+        err_detail = proc.stderr
+        if not err_detail.strip() and proc.stdout.strip():
+            err_detail = f"(stdout) {proc.stdout}"
+        elif proc.stderr.strip() and proc.stdout.strip() and proc.returncode != 0:
+            err_detail = f"{proc.stderr}\n(stdout) {proc.stdout}"
+        raise RuntimeError(f"Smoke test failed (exit {proc.returncode}): {err_detail}")
     return proc.stdout.strip()
 
 
 def install(agy_dir=None, stack_with_default=True, show_model=None, lang=None, ascii_mode=False):
+    if sys.platform in ("msys", "cygwin"):
+        raise RuntimeError(
+            "Detected MSYS2/Cygwin POSIX Python on Windows, which cannot configure native Windows agy statusLine. "
+            "Please run the Windows PowerShell installer instead:\n"
+            "  irm https://raw.githubusercontent.com/kkrr6840/agy-statusline/main/install.ps1 | iex"
+        )
+
     agy_dir = agy_dir or get_agy_dir()
     os.makedirs(agy_dir, exist_ok=True)
     target_script = os.path.join(agy_dir, "statusline.py")
@@ -237,11 +306,13 @@ def install(agy_dir=None, stack_with_default=True, show_model=None, lang=None, a
     if os.name != "nt":
         os.chmod(target_script, 0o755)
 
+    launcher_path = write_windows_launcher(target_script) if os.name == "nt" else None
     command = format_statusline_command(
         target_script,
         show_model=bool(show_model),
         lang=norm_lang,
         ascii_mode=bool(ascii_mode),
+        launcher_path=launcher_path,
     )
     preview = verify_script(target_script, command=command)
 
@@ -257,6 +328,8 @@ def install(agy_dir=None, stack_with_default=True, show_model=None, lang=None, a
 
     print(f"✓ Installed statusline script from {source_desc}")
     print(f"  Script:   {target_script}")
+    if launcher_path:
+        print(f"  Launcher: {launcher_path}")
     print(f"  Settings: {settings_path} (backup at {settings_path}.bak)")
     print(f"  Command:  {settings['statusLine']['command']}")
     print("\nPreview:")
@@ -266,6 +339,7 @@ def install(agy_dir=None, stack_with_default=True, show_model=None, lang=None, a
 def uninstall(agy_dir=None):
     agy_dir = agy_dir or get_agy_dir()
     target_script = os.path.join(agy_dir, "statusline.py")
+    launcher_path = os.path.join(agy_dir, "statusline.cmd")
     settings_path = os.path.join(agy_dir, "settings.json")
 
     if os.path.exists(settings_path):
@@ -277,6 +351,9 @@ def uninstall(agy_dir=None):
     if os.path.exists(target_script):
         os.remove(target_script)
         print(f"✓ Removed {target_script}")
+    if os.path.exists(launcher_path):
+        os.remove(launcher_path)
+        print(f"✓ Removed {launcher_path}")
 
 
 def main(argv=None):
